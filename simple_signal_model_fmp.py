@@ -38,6 +38,13 @@ def fetch_prices_fmp(symbol: str, api_key: Optional[str] = None) -> pd.DataFrame
         raise RuntimeError(f"FMP error {r.status_code}: {r.text[:800]}")
 
     data = r.json()
+    
+    print("FMP DEBUG",
+      {"url": r.url,
+       "status": r.status_code,
+       "keys": list(data.keys()) if isinstance(data, dict) else type(data).__name__,
+       "sample": (data if isinstance(data, dict) else (data[:1] if isinstance(data, list) else str(data)))})
+
 
     # shape handling
     if isinstance(data, dict):
