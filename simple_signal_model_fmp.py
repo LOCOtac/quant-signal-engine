@@ -375,3 +375,17 @@ if __name__ == "__main__":
 
     if args.explain:
         print(explain_scoring(res))
+
+
+def run_signal_analysis(symbol: str):
+    # existing logic here
+    # return structured dict, e.g.:
+    return {
+        "final_label": final_label,
+        "final_score": final_score,
+        "components": components,
+        "values": values_used
+    }
+
+if __name__ == "__main__":
+    print(run_signal_analysis("TSLA"))
