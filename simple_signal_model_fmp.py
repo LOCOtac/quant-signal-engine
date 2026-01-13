@@ -1,14 +1,52 @@
+# app.py
+# Railway-ready FastAPI backend + your full signal model in one file.
+# Endpoints:
+#   GET /health
+#   GET /analyze?symbol=TSLA&short=false
+
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, Any
 
 import os
+import math
 import numpy as np
 import pandas as pd
 import requests
 
+from fastapi import FastAPI, Query
+from fastapi.responses import JSONResponse
+
 FMP_STABLE_BASE = "https://financialmodelingprep.com/stable"
+
+
+# =========================
+# FASTAPI APP
+# =========================
+app = FastAPI(title="Quant Signal Engine", version="1.0.0")
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "service": "quant-signal-engine"}
+
+
+@app.get("/analyze")
+def analyze(
+    symbol: str = Query(..., description="Stock ticker (e.g., TSLA, AMD)"),
+    short: bool = Query(False, description="Use ~1 year of data (~260 rows)"),
+):
+    result = run_signal_analysis(symbol, short=short)
+
+    # Return 400 on user input issues, 500 on other errors
+    if result.get("final_label") == "error":
+        msg = (result.get("error") or "").lower()
+        if "missing symbol" in msg or "no historical data" in msg:
+            return JSONResponse(status_code=400, content=result)
+        return JSONResponse(status_code=500, content=result)
+
+    return result
 
 
 # =========================
@@ -23,34 +61,26 @@ def fetch_prices_fmp(symbol: str, api_key: Optional[str] = None) -> pd.DataFrame
       A) {"symbol": "TSLA", "historical": [ ... ]}
       B) [ ... ]  (list directly)
 
-    This loader supports both.
     Returns: df indexed by date ascending with columns: Open, High, Low, Close, Volume
     """
     api_key = api_key or os.getenv("FMP_API_KEY")
     if not api_key:
-        raise ValueError("Missing FMP_API_KEY. Set it: export FMP_API_KEY='YOUR_KEY'")
+        raise ValueError("Missing FMP_API_KEY. Set it as an environment variable in Railway.")
 
+    symbol = symbol.strip().upper()
     url = f"{FMP_STABLE_BASE}/historical-price-eod/full"
-    params = {"symbol": symbol.upper(), "apikey": api_key}
+    params = {"symbol": symbol, "apikey": api_key}
 
     r = requests.get(url, params=params, timeout=30)
     if r.status_code != 200:
         raise RuntimeError(f"FMP error {r.status_code}: {r.text[:800]}")
 
     data = r.json()
-    
-    print("FMP DEBUG",
-      {"url": r.url,
-       "status": r.status_code,
-       "keys": list(data.keys()) if isinstance(data, dict) else type(data).__name__,
-       "sample": (data if isinstance(data, dict) else (data[:1] if isinstance(data, list) else str(data)))})
-
 
     # shape handling
     if isinstance(data, dict):
         hist = data.get("historical")
         if hist is None:
-            # sometimes APIs return list under different keys; keep a fallback
             hist = data.get("data") or data.get("results")
     elif isinstance(data, list):
         hist = data
@@ -71,13 +101,7 @@ def fetch_prices_fmp(symbol: str, api_key: Optional[str] = None) -> pd.DataFrame
     df = df.sort_values("date").set_index("date")
 
     df = df.rename(
-        columns={
-            "open": "Open",
-            "high": "High",
-            "low": "Low",
-            "close": "Close",
-            "volume": "Volume",
-        }
+        columns={"open": "Open", "high": "High", "low": "Low", "close": "Close", "volume": "Volume"}
     )
 
     df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
@@ -132,9 +156,19 @@ def structure_signal(df: pd.DataFrame, lookback: int = 40) -> int:
     swing_low_idx = []
 
     for i in range(2, len(d) - 2):
-        if highs[i] > highs[i - 1] and highs[i] > highs[i + 1] and highs[i] > highs[i - 2] and highs[i] > highs[i + 2]:
+        if (
+            highs[i] > highs[i - 1]
+            and highs[i] > highs[i + 1]
+            and highs[i] > highs[i - 2]
+            and highs[i] > highs[i + 2]
+        ):
             swing_high_idx.append(i)
-        if lows[i] < lows[i - 1] and lows[i] < lows[i + 1] and lows[i] < lows[i - 2] and lows[i] < lows[i + 2]:
+        if (
+            lows[i] < lows[i - 1]
+            and lows[i] < lows[i + 1]
+            and lows[i] < lows[i - 2]
+            and lows[i] < lows[i + 2]
+        ):
             swing_low_idx.append(i)
 
     if len(swing_high_idx) < 2 or len(swing_low_idx) < 2:
@@ -204,7 +238,7 @@ def momentum_signal(df: pd.DataFrame) -> Tuple[int, float]:
 
 def long_term_filter(df: pd.DataFrame) -> Tuple[int, float]:
     """
-    SMA200 filter (not part of score, just a helpful snapshot):
+    SMA200 filter (not part of score, just snapshot):
       Close > SMA200 => +1
       Close < SMA200 => -1
       insufficient history => 0, nan
@@ -254,178 +288,73 @@ def run_simple_model(symbol: str, df: pd.DataFrame) -> SignalResult:
 
 
 # =========================
-# OUTPUT
+# JSON-SAFE BACKEND WRAPPER
 # =========================
-def format_result(res: SignalResult) -> str:
+def _nan_to_none(x: Any):
+    try:
+        if x is None:
+            return None
+        if isinstance(x, float) and math.isnan(x):
+            return None
+        return x
+    except Exception:
+        return None
+
+
+def run_signal_analysis(symbol: str, short: bool = False) -> dict:
     """
-    Short summary output.
+    Returns a JSON-friendly dict:
+      symbol
+      final_label
+      final_score
+      components {trend, momentum_rsi, structure}
+      values_used {close, ema20, ema50, rsi14, sma200, sma200_filter}
     """
-    snap = res.snapshot
-    sma200_val = snap["sma200"]
-    sma200_str = "nan" if np.isnan(sma200_val) else f"{sma200_val:.4f}"
-
-    return (
-        f"\n{res.symbol} => {res.label} (score={res.total_score})\n"
-        f"components: {res.components}\n"
-        f"snapshot: close={snap['close']:.4f}, "
-        f"ema20={snap['ema20']:.4f}, ema50={snap['ema50']:.4f}, "
-        f"rsi14={snap['rsi14']:.2f}, sma200={sma200_str}, "
-        f"sma200_filter={int(snap['sma200_filter'])}\n"
-    )
-
-
-def explain_scoring(res: SignalResult) -> str:
-    """
-    Detailed explanation of how the final score and label were produced.
-    """
-    c = res.components
-    s = res.snapshot
-
-    def vote_text(name: str, v: int) -> str:
-        if v == 1:
-            return f"{name}: +1 (Bullish)"
-        if v == -1:
-            return f"{name}: -1 (Bearish)"
-        return f"{name}:  0 (Neutral)"
-
-    trend_rule = (
-        "Trend rule:\n"
-        "  +1 if Close > EMA20 > EMA50\n"
-        "  -1 if Close < EMA20 < EMA50\n"
-        "   0 otherwise\n"
-        f"  Current: Close={s['close']:.4f}, EMA20={s['ema20']:.4f}, EMA50={s['ema50']:.4f}"
-    )
-
-    rsi_rule = (
-        "Momentum (RSI) rule:\n"
-        "  +1 if RSI14 > 60\n"
-        "  -1 if RSI14 < 40\n"
-        "   0 otherwise\n"
-        f"  Current: RSI14={s['rsi14']:.2f}"
-    )
-
-    structure_rule = (
-        "Structure rule (HH/HL vs LH/LL):\n"
-        "  +1 if last swing high is higher AND last swing low is higher (HH & HL)\n"
-        "  -1 if last swing high is lower  AND last swing low is lower  (LH & LL)\n"
-        "   0 otherwise / not enough pivots\n"
-        "  Current: uses last ~40 bars to find pivots"
-    )
-
-    scoring = (
-        "TOTAL SCORE = Trend + Momentum(RSI) + Structure\n"
-        "Label mapping:\n"
-        "  BULLISH if score >= +2\n"
-        "  BEARISH if score <= -2\n"
-        "  NEUTRAL otherwise\n"
-    )
-
-    sma200_str = "nan" if np.isnan(s["sma200"]) else f"{s['sma200']:.4f}"
-
-    lines = [
-        "\n=== SCORING EXPLANATION ===",
-        vote_text("Trend", c["trend"]),
-        vote_text("Momentum(RSI)", c["momentum_rsi"]),
-        vote_text("Structure", c["structure"]),
-        f"TOTAL: {res.total_score}  =>  {res.label}",
-        "",
-        trend_rule,
-        "",
-        rsi_rule,
-        "",
-        structure_rule,
-        "",
-        scoring,
-        "SMA200 filter (not part of score):",
-        "  +1 if Close > SMA200, -1 if Close < SMA200, 0 if SMA200 not available",
-        f"  Current: SMA200={sma200_str}, filter={int(s['sma200_filter'])}",
-    ]
-    return "\n".join(lines)
-
-
-# =========================
-# CLI
-# =========================
-if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(
-        description="Simple Bullish/Neutral/Bearish model using FMP stable EOD data"
-    )
-    parser.add_argument("symbol", type=str, help="Ticker symbol, e.g. TSLA")
-    parser.add_argument("--short", action="store_true", help="Use ~1 year of data (~260 rows)")
-    parser.add_argument("--explain", action="store_true", help="Print scoring explanation")
-    args = parser.parse_args()
-
-    df = fetch_prices_fmp(args.symbol)
-
-    if args.short:
-        df = df.iloc[-260:]
-
-    res = run_simple_model(args.symbol, df)
-    print(format_result(res))
-
-    print("\n--- Component Meaning ---")
-    print("trend: 1  = Bullish trend (Close > EMA20 > EMA50)")
-    print("trend: 0  = Neutral trend (mixed EMA alignment)")
-    print("trend: -1 = Bearish trend (Close < EMA20 < EMA50)")
-    print("")
-    print("momentum_rsi: 1  = Bullish momentum (RSI > 60)")
-    print("momentum_rsi: 0  = Neutral momentum (RSI between 40 and 60)")
-    print("momentum_rsi: -1 = Bearish momentum (RSI < 40)")
-    print("")
-    print("structure: 1  = Bullish structure (Higher High + Higher Low)")
-    print("structure: 0  = Neutral structure (mixed / no clear HH-HL or LH-LL)")
-    print("structure: -1 = Bearish structure (Lower High + Lower Low)")
-    print("-------------------------\n")
-
-
-    if args.explain:
-        print(explain_scoring(res))
-
-
-def run_signal_analysis(symbol: str):
-    final_label = "unknown"
-    final_score = 0.0
-    components = {"trend": None, "momentum_rsi": None, "structure": None}
-    values_used = {}
+    symbol = (symbol or "").strip().upper()
+    if not symbol:
+        return {
+            "symbol": symbol,
+            "final_label": "error",
+            "final_score": 0,
+            "components": {"trend": None, "momentum_rsi": None, "structure": None},
+            "values_used": {},
+            "error": "Missing symbol",
+        }
 
     try:
         df = fetch_prices_fmp(symbol, api_key=os.getenv("FMP_API_KEY"))
-
         if df is None or df.empty:
             return {
                 "symbol": symbol,
                 "final_label": "error",
-                "final_score": 0.0,
-                "components": components,
-                "values_used": values_used,
-                "error": "No price data returned"
+                "final_score": 0,
+                "components": {"trend": None, "momentum_rsi": None, "structure": None},
+                "values_used": {},
+                "error": "No price data returned",
             }
 
-        # =====================
-        # MODEL LOGIC GOES HERE
-        # set final_label, final_score, components, values_used
-        # =====================
+        if short:
+            df = df.iloc[-260:]
+
+        res = run_simple_model(symbol, df)
+
+        values_used = {k: _nan_to_none(v) for k, v in res.snapshot.items()}
+        components = {k: int(v) for k, v in res.components.items()}
 
         return {
-            "symbol": symbol,
-            "final_label": final_label,
-            "final_score": final_score,
+            "symbol": res.symbol,
+            "final_label": res.label,
+            "final_score": int(res.total_score),
             "components": components,
-            "values_used": values_used
+            "values_used": values_used,
         }
 
     except Exception as e:
         return {
             "symbol": symbol,
             "final_label": "error",
-            "final_score": 0.0,
-            "components": components,
-            "values_used": values_used,
-            "error": str(e)
+            "final_score": 0,
+            "components": {"trend": None, "momentum_rsi": None, "structure": None},
+            "values_used": {},
+            "error": str(e),
         }
-
-
-if __name__ == "__main__":
-    print(run_signal_analysis("TSLA"))
