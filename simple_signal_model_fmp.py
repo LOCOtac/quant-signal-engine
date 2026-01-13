@@ -378,14 +378,47 @@ if __name__ == "__main__":
 
 
 def run_signal_analysis(symbol: str):
-    # existing logic here
-    # return structured dict, e.g.:
-    return {
-        "final_label": final_label,
-        "final_score": final_score,
-        "components": components,
-        "values": values_used
-    }
+    final_label = "unknown"
+    final_score = 0.0
+    components = {"trend": None, "momentum_rsi": None, "structure": None}
+    values_used = {}
+
+    try:
+        df = fetch_prices_fmp(symbol, api_key=os.getenv("FMP_API_KEY"))
+
+        if df is None or df.empty:
+            return {
+                "symbol": symbol,
+                "final_label": "error",
+                "final_score": 0.0,
+                "components": components,
+                "values_used": values_used,
+                "error": "No price data returned"
+            }
+
+        # =====================
+        # MODEL LOGIC GOES HERE
+        # set final_label, final_score, components, values_used
+        # =====================
+
+        return {
+            "symbol": symbol,
+            "final_label": final_label,
+            "final_score": final_score,
+            "components": components,
+            "values_used": values_used
+        }
+
+    except Exception as e:
+        return {
+            "symbol": symbol,
+            "final_label": "error",
+            "final_score": 0.0,
+            "components": components,
+            "values_used": values_used,
+            "error": str(e)
+        }
+
 
 if __name__ == "__main__":
     print(run_signal_analysis("TSLA"))
